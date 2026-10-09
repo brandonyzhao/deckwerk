@@ -195,7 +195,8 @@ export function agentFixtureDeck(): Deck {
         elements: [
           { id: 'media-picture', type: 'image', x: 120, y: 120, w: 600, h: 400, z: 3, src: 'assets/pic.png' },
           { id: 'media-box', type: 'shape', shape: 'rect', x: 800, y: 120, w: 400, h: 300, z: 7, fill: '#cc5533' },
-          text('media-caption', 'A picture and a box', { x: 120, y: 600, w: 1200, h: 100 }, { z: 9, class: ['role-caption'] }),
+          // Runs of spaces, as PowerPoint imports carry them between affiliations.
+          text('media-caption', 'A picture     and a <sup>2</sup>box', { x: 120, y: 600, w: 1200, h: 100 }, { z: 9, class: ['role-caption'] }),
         ],
       },
       {
