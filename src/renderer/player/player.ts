@@ -18,6 +18,7 @@ import {
   fitAutoTextElement,
   renderSlide,
   videoPresentationKey,
+  whenWebElementReady,
 } from './render.js';
 import { decodeImage, revealImagesWhenDecoded } from './imageDecode.js';
 import {
@@ -35,7 +36,9 @@ import {
 } from '@shared/morph.js';
 import { morphTransforms, type Rect, type TextLayout } from './morphTransform.js';
 import { isPendingSrc } from '@shared/media.js';
-import { WEB_BRIDGE_SOURCE, isWebBridgeAction, type WebBridgeEvent } from '@shared/webBridge.js';
+import {
+  WEB_BRIDGE_SOURCE, isEmbeddableWebSrc, isWebBridgeAction, type WebBridgeEvent,
+} from '@shared/webBridge.js';
 
 /**
  * The runtime that owns navigation and turns timeline entries into DOM and
@@ -75,6 +78,27 @@ const VIDEO_WARM_ELEMENT_LIMIT = 4;
 const VIDEO_WARM_TIMEOUT_MS = 20_000;
 /** How long the lookahead waits for the visible slide before starting anyway. */
 const LOOKAHEAD_HOLD_MS = 2_000;
+
+/**
+ * How many slides with live web pages are kept loaded off screen: the next
+ * ones (within `WARM_AHEAD_SLIDES`) and the one just left. Each is a whole
+ * browsing context -- a WebGL page can hold hundreds of megabytes -- so the
+ * window is deliberately small.
+ */
+const WEB_PRELOAD_SLIDE_LIMIT = 2;
+
+/**
+ * A slide whose web pages are loaded ahead of being shown, on a stage of its
+ * own. See `preloadUpcomingWebPages`.
+ */
+interface WebPreload {
+  slideId: string;
+  stage: HTMLElement;
+  /** The web element wrappers on it, by element id, with what each was rendered from. */
+  frames: Map<string, { node: HTMLElement; key: string }>;
+  /** Settles once every page on it is showing (or has timed out trying). */
+  ready: Promise<void>;
+}
 
 /** A video the lookahead wants decoded before its slide is reached. */
 interface VideoWarmTarget {
@@ -154,6 +178,15 @@ export class Player {
   /** Fully decoded images for the next presentable slides, kept alive until use. */
   private warmedImages = new Map<string, HTMLImageElement>();
   private imageWarmGeneration = 0;
+  /**
+   * Slides whose web pages are loading, or already showing, off screen, by
+   * slide id. Each has a stage of its own beside the visible one.
+   */
+  private webPreloads = new Map<string, WebPreload>();
+  private webPreloadGeneration = 0;
+  /** Web frames whose `load` the bridge is watching, and those that have loaded. */
+  private webFramesWatched = new WeakSet<HTMLIFrameElement>();
+  private webFramesLoaded = new WeakSet<HTMLIFrameElement>();
 
   constructor(opts: PlayerOptions) {
     this.deck = opts.deck;
@@ -194,22 +227,33 @@ export class Player {
 
   /**
    * Tell every web frame on the stage what the deck is doing. A frame that is
-   * still loading has no listener yet, so the message is repeated when it
-   * loads — a page's `onActive` then fires exactly once, whichever came first.
+   * still loading has no listener yet, so it hears the latest event when it
+   * loads instead — a page's `onActive` then fires exactly once. Posting to it
+   * now as well would reach a page whose scripts have run but whose `load` is
+   * still pending (a preloaded page is often in that state) twice.
    */
   private notifyWebFrames(event: WebBridgeEvent): void {
     this.lastWebEvent = event;
     for (const frame of this.stage.querySelectorAll<HTMLIFrameElement>('iframe.web-frame')) {
-      if (frame.dataset.bridgeBound !== 'true') {
-        frame.dataset.bridgeBound = 'true';
-        frame.addEventListener('load', () => {
-          if (frame.isConnected && this.lastWebEvent) {
-            frame.contentWindow?.postMessage(this.lastWebEvent, '*');
-          }
-        });
-      }
-      frame.contentWindow?.postMessage(event, '*');
+      this.watchWebFrame(frame);
+      if (this.webFramesLoaded.has(frame)) frame.contentWindow?.postMessage(event, '*');
     }
+  }
+
+  /**
+   * Note when a frame loads, and replay the deck's latest event to it then if
+   * it is on the visible stage. A preloaded frame is watched from the moment
+   * it is created, so its page loads unaware of the deck until it is shown.
+   */
+  private watchWebFrame(frame: HTMLIFrameElement): void {
+    if (this.webFramesWatched.has(frame)) return;
+    this.webFramesWatched.add(frame);
+    frame.addEventListener('load', () => {
+      this.webFramesLoaded.add(frame);
+      if (this.stage.contains(frame) && this.lastWebEvent) {
+        frame.contentWindow?.postMessage(this.lastWebEvent, '*');
+      }
+    });
   }
 
   /**
@@ -275,6 +319,9 @@ export class Player {
     this.videoPool.clear();
     for (const image of this.warmedImages.values()) image.removeAttribute('src');
     this.warmedImages.clear();
+    // Disconnecting a preloaded stage unloads its pages with it.
+    this.webPreloadGeneration += 1;
+    this.webPreloads.clear();
     this.container.replaceChildren();
   }
 
@@ -328,6 +375,7 @@ export class Player {
     const slides = this.deck.slides;
     if (slides.length === 0) {
       this.stage.replaceChildren();
+      this.pruneWebPreloads();
       return;
     }
     const previousSlideIndex = this.cursor.slide;
@@ -404,7 +452,12 @@ export class Player {
     const rendered = renderSlide(slide, { resolveSrc: this.resolveSrc });
     this.adoptWarmedImages(rendered);
     revealImagesWhenDecoded(rendered);
-    this.stage.replaceChildren(rendered);
+    this.mountSlide(
+      rendered,
+      slide,
+      previousSlideIndex !== this.cursor.slide ? previousSlide : undefined,
+    );
+    this.pruneWebPreloads();
     this.notifyWebFrames({ source: WEB_BRIDGE_SOURCE, event: 'active', step: this.cursor.step, steps });
 
     // Two passes, because identity has to win globally rather than per node: a
@@ -534,6 +587,122 @@ export class Player {
   }
 
   /**
+   * Put a freshly rendered slide on screen.
+   *
+   * Usually that is the render replacing whatever the one stage held. A web
+   * page, though, cannot be loaded somewhere and then moved into place: a
+   * frame inserted anywhere loads again, and this Chromium has no
+   * state-preserving move (`moveBefore`). So a slide whose pages were
+   * preloaded is shown on the stage they loaded on: the rest of the render is
+   * laid in around their waiting wrappers and that stage takes the visible
+   * one's place. The stage being left is kept the same way, stripped down to
+   * its pages, while its slide stays within reach — stepping back one slide
+   * is the common case.
+   */
+  private mountSlide(rendered: HTMLElement, slide: Slide, left: Slide | undefined): void {
+    const preload = this.webPreloads.get(slide.id);
+    if (preload) this.webPreloads.delete(slide.id);
+    const previous = this.stage;
+    const keep = left !== undefined
+      && previous.querySelector<HTMLElement>(':scope > .slide')?.dataset.slideId === left.id
+      && this.webPreloadTargets(this.cursor.slide, (candidate) =>
+        candidate === left || this.webPreloads.has(candidate.id)).includes(left);
+    if (!preload && !keep) {
+      previous.replaceChildren(rendered);
+      return;
+    }
+    let stage: HTMLElement;
+    if (preload) {
+      this.graftPreloadedFrames(preload, rendered, slide);
+      stage = preload.stage;
+    } else {
+      stage = document.createElement('div');
+      stage.className = 'stage';
+      stage.appendChild(rendered);
+      this.container.appendChild(stage);
+    }
+    showStage(stage, previous);
+    this.stage = stage;
+    // Removing the left stage (or stripping it) is what detaches its videos,
+    // which goTo then adopts or pools exactly as after a replaceChildren.
+    if (keep) this.parkStage(previous, left!);
+    else previous.remove();
+  }
+
+  /**
+   * Lay a fresh render in around the preloaded web wrappers of the same slide.
+   *
+   * The wrappers stay exactly where they are -- moving one reloads its page --
+   * and every other node of the render is inserted around them in the
+   * render's own order, so paint order is the render's. A wrapper is only
+   * kept if it was rendered from exactly the element the slide has now, and
+   * in the same order as the render; otherwise the fresh one stands in, and
+   * the stale page is dropped. (The render's own, never-connected, frame for
+   * a kept page never loads; its reveal timer just lapses.)
+   */
+  private graftPreloadedFrames(preload: WebPreload, rendered: HTMLElement, slide: Slide): void {
+    const root = preload.stage.querySelector<HTMLElement>(':scope > .slide');
+    if (!root) {
+      preload.stage.replaceChildren(rendered);
+      return;
+    }
+    const keys = webElementKeys(slide);
+    const kept = new Set<Element>();
+    let last: Element | null = null;
+    const order = [...rendered.children].map((fresh) => {
+      const id = (fresh as HTMLElement).dataset.elementId;
+      const twin = id ? preload.frames.get(id) : undefined;
+      if (!twin || twin.key !== keys.get(id!) || twin.node.parentElement !== root) return fresh;
+      if (last && !(last.compareDocumentPosition(twin.node) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+        return fresh;
+      }
+      kept.add(twin.node);
+      last = twin.node;
+      return twin.node;
+    });
+    for (const child of [...root.childNodes]) {
+      if (!kept.has(child as Element)) child.remove();
+    }
+    for (const name of root.getAttributeNames()) root.removeAttribute(name);
+    for (const { name, value } of [...rendered.attributes]) root.setAttribute(name, value);
+    const anchors = order.filter((node) => kept.has(node));
+    let next = 0;
+    for (const node of order) {
+      if (kept.has(node)) next += 1;
+      else root.insertBefore(node, anchors[next] ?? null);
+    }
+  }
+
+  /**
+   * Keep a stage that is leaving the screen as a preload of its own slide:
+   * everything but its live web wrappers is removed, it is hidden like any
+   * preload, and its pages are told the deck has left them.
+   */
+  private parkStage(stage: HTMLElement, slide: Slide): void {
+    const root = stage.querySelector<HTMLElement>(':scope > .slide');
+    const keys = webElementKeys(slide);
+    const frames = new Map<string, { node: HTMLElement; key: string }>();
+    for (const child of [...stage.children]) if (child !== root) child.remove();
+    for (const child of [...(root?.children ?? [])] as HTMLElement[]) {
+      const id = child.dataset.elementId;
+      const key = id ? keys.get(id) : undefined;
+      if (id && key !== undefined && child.dataset.elementType === 'web') frames.set(id, { node: child, key });
+      else child.remove();
+    }
+    if (frames.size === 0) {
+      stage.remove();
+      return;
+    }
+    hideStage(stage);
+    for (const frame of stage.querySelectorAll<HTMLIFrameElement>('iframe.web-frame')) {
+      if (this.webFramesLoaded.has(frame)) {
+        frame.contentWindow?.postMessage({ source: WEB_BRIDGE_SOURCE, event: 'inactive' }, '*');
+      }
+    }
+    this.webPreloads.set(slide.id, { slideId: slide.id, stage, frames, ready: stageWebReady(stage) });
+  }
+
+  /**
    * Pull the video files of the next couple of slides into the HTTP cache,
    * one file at a time, while the current slide is on screen.
    *
@@ -628,6 +797,116 @@ export class Player {
     this.warmUpcomingVideoElements(videoTargets);
     this.warmUpcomingImages(upcomingSlides);
     this.pumpWarmQueue();
+    this.preloadUpcomingWebPages();
+  }
+
+  /**
+   * Load the web pages of the next slides before they are reached.
+   *
+   * A web element's frame used to be created only when its slide rendered, so
+   * a heavy page -- a WebGL viewer that builds its scene from megabytes of
+   * data -- sat under its poster for seconds every time the talk arrived at
+   * it. Here an upcoming slide's web elements are rendered, alone, onto a
+   * stage of their own, laid exactly over the visible one but unseen
+   * (`hideStage`), and left to load, run and draw; `mountSlide` shows that
+   * stage when the slide comes up, so its page is already live. The page is
+   * not told it is active until then (`watchWebFrame`), and cannot drive the
+   * deck meanwhile: `onWebBridgeMessage` only hears the visible stage.
+   *
+   * One page at a time, and only once the visible slide's own pages are
+   * showing: a preload competing with the page the audience is waiting for
+   * would only make that one slower.
+   */
+  private preloadUpcomingWebPages(): void {
+    const targets = this.pruneWebPreloads();
+    const generation = this.webPreloadGeneration;
+    // Only slides ahead are loaded afresh; the one behind is kept, never made.
+    const missing = targets.filter((slide) =>
+      !this.webPreloads.has(slide.id) && this.deck.slides.indexOf(slide) > this.cursor.slide);
+    if (missing.length === 0) return;
+    void stageWebReady(this.stage).then(async () => {
+      for (const slide of missing) {
+        if (generation !== this.webPreloadGeneration) return;
+        if (this.webPreloads.has(slide.id)) continue;
+        await this.preloadWebSlide(slide).ready;
+      }
+    });
+  }
+
+  /** Render one slide's web elements onto a hidden stage of their own and let them load. */
+  private preloadWebSlide(slide: Slide): WebPreload {
+    const elements = liveWebElements(slide);
+    // The slide's own root, so its layout classes apply as they will when
+    // shown, but none of its paint: the graft takes the root's look from the
+    // real render.
+    const root = renderSlide({ ...slide, elements }, { resolveSrc: this.resolveSrc });
+    root.removeAttribute('style');
+    const keys = webElementKeys(slide);
+    const frames = new Map<string, { node: HTMLElement; key: string }>();
+    for (const node of [...root.children] as HTMLElement[]) {
+      const id = node.dataset.elementId;
+      const key = id ? keys.get(id) : undefined;
+      if (id && key !== undefined) frames.set(id, { node, key });
+    }
+    // Watched before the stage is connected, which is what starts the load.
+    for (const frame of root.querySelectorAll<HTMLIFrameElement>('iframe.web-frame')) {
+      this.watchWebFrame(frame);
+    }
+    const stage = document.createElement('div');
+    stage.className = 'stage';
+    hideStage(stage);
+    stage.appendChild(root);
+    this.scaleStage(stage);
+    this.container.appendChild(stage);
+    const preload: WebPreload = { slideId: slide.id, stage, frames, ready: stageWebReady(stage) };
+    this.webPreloads.set(slide.id, preload);
+    return preload;
+  }
+
+  /**
+   * The slides whose web pages are worth having loaded while slide `index` is
+   * shown, most useful first: the next slide, then the one just left -- only
+   * if `retained` says it is still loaded, since going back is a maybe -- then
+   * the one after next. Skipped slides are walked past, as by the media
+   * lookahead.
+   */
+  private webPreloadTargets(index: number, retained: (slide: Slide) => boolean): Slide[] {
+    const slides = this.deck.slides;
+    const ahead: Slide[] = [];
+    for (let i = index + 1; i < slides.length && ahead.length < WARM_AHEAD_SLIDES; i += 1) {
+      if (!slides[i].skipped) ahead.push(slides[i]);
+    }
+    let behind: Slide | undefined;
+    for (let i = Math.min(index, slides.length) - 1; i >= 0 && !behind; i -= 1) {
+      if (!slides[i].skipped) behind = slides[i];
+    }
+    return [ahead[0], behind && retained(behind) ? behind : undefined, ...ahead.slice(1)]
+      .filter((slide): slide is Slide => slide !== undefined && liveWebElements(slide).length > 0)
+      .slice(0, WEB_PRELOAD_SLIDE_LIMIT);
+  }
+
+  /**
+   * Drop every preloaded slide that is no longer wanted, or whose pages have
+   * changed since they were loaded, and stop any preloading still walking
+   * towards the old window. Returns the current window.
+   */
+  private pruneWebPreloads(): Slide[] {
+    this.webPreloadGeneration += 1;
+    const targets = this.webPreloadTargets(this.cursor.slide, (slide) => this.webPreloads.has(slide.id));
+    const wanted = new Map(targets.map((slide) => [slide.id, slide]));
+    for (const [id, preload] of this.webPreloads) {
+      const slide = wanted.get(id);
+      if (slide) {
+        const keys = webElementKeys(slide);
+        const current = keys.size === preload.frames.size
+          && [...preload.frames].every(([elementId, frame]) => keys.get(elementId) === frame.key);
+        if (current) continue;
+      }
+      // Disconnecting the stage unloads its pages.
+      preload.stage.remove();
+      this.webPreloads.delete(id);
+    }
+    return targets;
   }
 
   /**
@@ -1512,10 +1791,70 @@ export class Player {
   }
 
   private rescale(): void {
+    this.scaleStage(this.stage);
+    for (const preload of this.webPreloads.values()) this.scaleStage(preload.stage);
+  }
+
+  private scaleStage(stage: HTMLElement): void {
     const r = this.container.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
-    applyStageScale(this.stage, this.deck, { w: r.width, h: r.height });
+    applyStageScale(stage, this.deck, { w: r.width, h: r.height });
   }
+}
+
+type WebElement = Extract<SlideElement, { type: 'web' }>;
+
+/** A slide's web elements that render a live page (not an "unsupported" box). */
+function liveWebElements(slide: Slide): WebElement[] {
+  return slide.elements.filter(
+    (element): element is WebElement => element.type === 'web' && isEmbeddableWebSrc(element.src),
+  );
+}
+
+/**
+ * What each live web element was rendered from, by id. A preloaded wrapper is
+ * only shown for an element that is still exactly this.
+ */
+function webElementKeys(slide: Slide): Map<string, string> {
+  return new Map(liveWebElements(slide).map((element) => [element.id, JSON.stringify(element)]));
+}
+
+/** Settles once every live web element on a stage is showing its page, or gave up waiting. */
+function stageWebReady(stage: HTMLElement): Promise<void> {
+  return Promise.all([...stage.querySelectorAll('.web-body')].map(whenWebElementReady))
+    .then(() => undefined);
+}
+
+/**
+ * Keep an off-screen stage laid out exactly where the visible one is, but
+ * unseen and out of reach.
+ *
+ * On screen rather than parked outside the viewport, and never
+ * `display: none`: Chromium stops rendering a cross-origin frame it considers
+ * out of view -- no animation frames -- so a WebGL page would not draw until
+ * it was shown, which is the very wait preloading removes
+ * (webElementPreloadBrowser.test.ts catches exactly that). Opacity rather
+ * than `visibility: hidden`, because it composites the stage as a whole: the
+ * build state writes `visibility: visible` on elements, which would show
+ * through an inherited `hidden` (see `toggleBlank`). `inert` keeps the
+ * pointer and focus out, which `pointer-events` on the stage alone would not:
+ * an interactive page's frame sets its own.
+ */
+function hideStage(stage: HTMLElement): void {
+  stage.classList.add('stage-preload');
+  stage.style.opacity = '0';
+  stage.style.pointerEvents = 'none';
+  stage.setAttribute('inert', '');
+  stage.setAttribute('aria-hidden', 'true');
+}
+
+/** Undo `hideStage` for the stage taking over from `previous`, blanked if it was. */
+function showStage(stage: HTMLElement, previous: HTMLElement): void {
+  stage.classList.remove('stage-preload');
+  stage.style.opacity = previous.style.opacity;
+  stage.style.removeProperty('pointer-events');
+  stage.removeAttribute('inert');
+  stage.removeAttribute('aria-hidden');
 }
 
 /**
