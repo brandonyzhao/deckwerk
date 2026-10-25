@@ -17,10 +17,12 @@ import {
 } from '../main/deckStore.js';
 import { exportDeck, webExportUnavailableReason } from '../main/exportDeck.js';
 import { capabilities } from '../shared/capabilities.js';
-import { getFfmpegPath, getFfprobePath, probeMedia } from '../main/ffmpeg.js';
+import { extractStillFrame, getFfmpegPath, getFfprobePath, probeMedia } from '../main/ffmpeg.js';
+import { createFrameCache } from '../main/frameCache.js';
 import { DeckWire } from './deckWire.js';
 import {
   RenditionStore,
+  defaultRenditionCacheDir,
   isVideoAsset,
   pruneRenditions,
   type RenditionOptions,
@@ -213,6 +215,13 @@ interface Room {
    * to stop existing under this id.
    */
   relocating: boolean;
+  /**
+   * Remotes, by the presentation surface that offered them: for each
+   * presenter, the peers it offered its remote to and whether they took it.
+   * The server relays a click only along a granted pair, so nobody can drive
+   * a presentation its presenter did not hand them.
+   */
+  remotes: Map<string, Map<string, 'offered' | 'granted'>>;
 }
 
 interface HttpHtmlDraft {
@@ -332,6 +341,11 @@ export interface CollabServerOptions {
    * turns it on, a desktop app sharing one deck has no imports to keep.
    */
   keepUploadsDays?: number;
+  /**
+   * Where the print tab's video stills are cached (`/api/video-still`).
+   * Defaults to a folder beside the rendition cache; tests pass their own.
+   */
+  printStillCacheDir?: string;
 }
 
 export interface RunningCollabServer {
@@ -401,6 +415,16 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       typeof options.mediaRenditions === 'object' ? options.mediaRenditions.cacheDir : undefined,
     ).catch(() => 0);
   }
+  /**
+   * Video stills for the print tab. A PDF needs one picture per video, never
+   * playback, and a browser asked to load every video in a long deck at once
+   * runs out of memory or crashes its media thread; ffmpeg cuts them here
+   * instead, three at a time, cached outside the decks.
+   */
+  const printStillDir = options.printStillCacheDir ?? join(dirname(defaultRenditionCacheDir()), 'print-stills');
+  const printStillFor = createFrameCache({ dir: () => printStillDir, extract: extractStillFrame });
+  // A still is a second of ffmpeg to recut; a month unused is long enough.
+  void pruneRenditions(printStillDir, 30 * 24 * 60 * 60 * 1000).catch(() => 0);
   // Kept as a local alias while the private panel transport is renamed. This
   // is only connection/activity state; DeckWerk never owns or invokes an agent.
   const sharedAgent = localAgents;
@@ -766,13 +790,7 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       }
       if (toId !== fromId) {
         localAgents?.relocate(fromDir, toDir, `The presentation was renamed to “${title}”.`);
-        // Forwarding addresses stay one hop: whatever pointed at the old id
-        // now points at the new one.
-        for (const [oldId, target] of movedDecks) {
-          if (target.id === fromId) movedDecks.set(oldId, { id: toId, title });
-        }
-        movedDecks.set(fromId, { id: toId, title });
-        movedDecks.delete(toId);
+        noteMoved(fromId, toId, title);
       }
       for (const peer of room?.peers.values() ?? []) {
         // Greeted or not: one still mid-hello must not reconnect to the old id.
@@ -782,6 +800,98 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       return null;
     } finally {
       relocations.delete(fromId);
+      settle();
+    }
+  }
+
+  /** Leave a forwarding address at a deck's old id. */
+  function noteMoved(fromId: string, toId: string, title: string): void {
+    // Forwarding addresses stay one hop: whatever pointed at the old id now
+    // points at the new one.
+    for (const [oldId, target] of movedDecks) {
+      if (target.id === fromId) movedDecks.set(oldId, { id: toId, title });
+    }
+    movedDecks.set(fromId, { id: toId, title });
+    movedDecks.delete(toId);
+  }
+
+  /** Every deck id at any depth under a folder, read from disk. */
+  async function deckIdsUnder(folderPath: string, depth = 0): Promise<string[]> {
+    if (depth >= MAX_FOLDER_DEPTH) return [];
+    let entries;
+    try {
+      entries = await readdir(folderDirOf(folderPath), { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const ids: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const childId = `${folderPath}/${entry.name}`;
+      if (isDeckDir(join(rootDir, childId))) ids.push(childId);
+      else if (splitDeckPath(childId)) ids.push(...await deckIdsUnder(childId, depth + 1));
+    }
+    return ids;
+  }
+
+  /**
+   * Rename a folder, with people inside it or not. Every deck in it is filed
+   * under the folder's path, so this is relocateDeck's live rename done for
+   * all of them at once: their rooms stop applying edits and close (writing
+   * what they accepted), the folder moves, and every peer is sent on to its
+   * deck's new id. Each deck also gets a forwarding address, for a client that
+   * was offline during the rename.
+   */
+  async function relocateFolder(from: string, to: string): Promise<{ status: number; error: string } | null> {
+    const under = (id: string): boolean => id.startsWith(`${from}/`);
+    const ids = new Set([
+      ...await deckIdsUnder(from),
+      ...[...rooms.keys()].filter(under),
+      ...[...roomsOpening.keys()].filter(under),
+    ]);
+    if ([...relocations.keys()].some(under)) {
+      return { status: 409, error: 'a presentation in this folder is being moved or renamed — try again in a moment' };
+    }
+    // Registered before the first await, so a socket or route arriving from
+    // here on waits for the folder to land instead of opening a deck in it.
+    let settle!: () => void;
+    const landed = new Promise<void>((resolvePromise) => { settle = resolvePromise; });
+    for (const id of ids) relocations.set(id, landed);
+    try {
+      await Promise.all([...ids].map((id) => roomsOpening.get(id)?.catch(() => undefined)));
+      const closed = new Map<string, Room>();
+      for (const id of ids) {
+        const room = rooms.get(id);
+        if (room) {
+          room.relocating = true;
+          await room.session.close();
+          rooms.delete(id);
+          closed.set(id, room);
+        }
+        forgetDeckState(id);
+      }
+      try {
+        await rename(folderDirOf(from), folderDirOf(to));
+      } catch (error) {
+        // The sessions are already closed. Send their peers through an
+        // ordinary reconnect, which opens whatever the disk now holds.
+        for (const room of closed.values()) for (const peer of room.peers.values()) peer.socket.close(1011, 'renaming failed');
+        throw error;
+      }
+      for (const id of ids) {
+        const toId = `${to}${id.slice(from.length)}`;
+        const title = await loadDeck(deckDirOf(toId)).then((deck) => deck.title, () => basename(toId));
+        localAgents?.relocate(deckDirOf(id), deckDirOf(toId), `The presentation's folder was renamed; it is now at “${toId}”.`);
+        noteMoved(id, toId, title);
+        for (const peer of closed.get(id)?.peers.values() ?? []) {
+          // Greeted or not: one still mid-hello must not reconnect to the old id.
+          send(peer, { kind: 'deckMoved', deckId: toId, title });
+          peer.socket.close(COLLAB_CLOSE.moved, 'presentation renamed');
+        }
+      }
+      return null;
+    } finally {
+      for (const id of ids) relocations.delete(id);
       settle();
     }
   }
@@ -985,6 +1095,7 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       agentPresence: null,
       participantLogins: new Map(),
       relocating: false,
+      remotes: new Map(),
     };
     session.watch({
       onExternalDeck: (deck, seq) => broadcast(room, {
@@ -1011,6 +1122,15 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
 
   /** Messages carrying a whole deck are spliced from a cache (deckWire.ts). */
   const wire = new DeckWire();
+
+  /** Dissolve the remote between two peers, whichever side holds it, and tell the one still here. */
+  function endRemote(room: Room, from: string, to: string): void {
+    const ended = room.remotes.get(from)?.delete(to) || room.remotes.get(to)?.delete(from);
+    for (const id of [from, to]) if (room.remotes.get(id)?.size === 0) room.remotes.delete(id);
+    const other = room.peers.get(to);
+    if (ended && other) send(other, { kind: 'remote-end', from });
+  }
+
   const send = (peer: Peer, message: ServerMessage) => {
     if (peer.socket.readyState === peer.socket.OPEN) peer.socket.send(wire.encode(message), { binary: false });
   };
@@ -1419,7 +1539,7 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     // A view-only participant never gets the editor shell. It would let them
     // move things on screen that the server then refuses, so they get the
     // presentation page instead — read-only by construction, and live.
-    if ((path === '/' || path === '/index.html') && deckParam
+    if ((path === '/' || path === '/index.html' || path === '/mobile.html') && deckParam
       && (await deckRoleOf(identity, deckParam)) === 'view') {
       return redirectToViewer(response, url);
     }
@@ -1939,22 +2059,10 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
         return respondJson(response, 400, { error: 'missing or invalid name' });
       }
       if (existsSync(to)) return respondJson(response, 409, { error: `"${renamed}" already exists` });
-      const inside = [...rooms.keys()].filter((id) => id.startsWith(`${target}/`));
-      if (inside.some((id) => (rooms.get(id)?.peers.size ?? 0) > 0)) {
-        return respondJson(response, 409, {
-          error: 'somebody has a presentation in this folder open — close it everywhere before renaming it',
-        });
-      }
-      for (const id of inside) {
-        const room = rooms.get(id);
-        if (room) {
-          await room.session.flush();
-          await room.session.close();
-          rooms.delete(id);
-        }
-        forgetDeckState(id);
-      }
-      await rename(dir, to);
+      // People with a presentation in it open are taken along, as with a
+      // deck rename: their clients follow the deckMoved to the new path.
+      const refused = await relocateFolder(target, renamed);
+      if (refused) return respondJson(response, refused.status, { error: refused.error });
       respondJson(response, 200, { path: renamed });
       return;
     }
@@ -2310,6 +2418,32 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       } catch (error) {
         respondJson(response, 400, { error: String(error instanceof Error ? error.message : error) });
       }
+      return;
+    }
+
+    // One full-resolution frame of a deck video, for the print tab. 404 when
+    // no still can be cut (an alpha clip, a broken file): the tab then loads
+    // that one video itself.
+    if (path === '/api/video-still' && request.method === 'GET') {
+      const src = url.searchParams.get('src');
+      const time = Number(url.searchParams.get('t') ?? 0);
+      if (!src || !deckParam) return respondJson(response, 400, { error: 'missing deck or src' });
+      let absolute: string;
+      try {
+        absolute = resolveAsset(deckDirOf(deckParam), src);
+      } catch {
+        return respondJson(response, 403, { error: 'forbidden' });
+      }
+      if (!isVideoAsset(absolute)) return respondJson(response, 400, { error: 'not a video' });
+      const name = await printStillFor(absolute, time);
+      if (!name) return respondJson(response, 404, { error: 'no still for this video' });
+      const still = join(printStillDir, name);
+      response.writeHead(200, {
+        'content-type': 'image/jpeg',
+        'content-length': String(statSync(still).size),
+        'cache-control': 'private, max-age=300',
+      });
+      createReadStream(still).pipe(response);
       return;
     }
 
@@ -3695,6 +3829,8 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
             room.participantLogins.set(message.participant, identity.login);
           }
         }
+        if (message.presenting) peer.state.presenting = true;
+        if (message.device) peer.state.device = message.device;
         room.guestCounter += 1;
         // With access control on, presence carries the authenticated identity —
         // a client-supplied name is only trusted on the flagless server.
@@ -3796,11 +3932,54 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
             });
           }
           return;
+        case 'remote-offer': {
+          // Only a presentation offers its remote, and only to a person.
+          const target = room.peers.get(message.to);
+          if (!peer.state.presenting || !target?.greeted || target === peer
+            || target.agentFor || target.state.agent || target.state.presenting) return;
+          let offered = room.remotes.get(clientId);
+          if (!offered) room.remotes.set(clientId, offered = new Map());
+          if (offered.get(message.to) === 'granted') return;
+          offered.set(message.to, 'offered');
+          send(target, { kind: 'remote-offer', from: clientId, name: peer.state.name.replace(/ \(presenting\)$/, '') });
+          return;
+        }
+        case 'remote-answer': {
+          const offered = room.remotes.get(message.to);
+          const presenter = room.peers.get(message.to);
+          if (offered?.get(clientId) !== 'offered' || !presenter) return;
+          if (message.accept) offered.set(clientId, 'granted');
+          else offered.delete(clientId);
+          send(presenter, { kind: 'remote-answer', from: clientId, accept: message.accept });
+          return;
+        }
+        case 'remote-command': {
+          const presenter = room.peers.get(message.to);
+          if (room.remotes.get(message.to)?.get(clientId) !== 'granted' || !presenter) return;
+          send(presenter, { kind: 'remote-command', from: clientId, command: message.command });
+          return;
+        }
+        case 'remote-state': {
+          for (const [remoteId, status] of room.remotes.get(clientId) ?? []) {
+            const remote = room.peers.get(remoteId);
+            if (status === 'granted' && remote) send(remote, { kind: 'remote-state', from: clientId, state: message.state });
+          }
+          return;
+        }
+        case 'remote-end':
+          endRemote(room, clientId, message.to);
+          return;
       }
     });
 
     socket.on('close', () => {
       room.peers.delete(clientId);
+      // A presentation that ends takes its remotes with it; a remote that
+      // closes its page hands the remote back.
+      for (const remoteId of [...room.remotes.get(clientId)?.keys() ?? []]) endRemote(room, clientId, remoteId);
+      for (const [presenterId, offered] of room.remotes) {
+        if (offered.has(clientId)) endRemote(room, clientId, presenterId);
+      }
       if (peer.greeted) broadcast(room, { kind: 'peerLeft', clientId });
       if (peer.agentFor && localAgents) localAgents.detach(room.session.dir, peer.agentFor, clientId);
     });
